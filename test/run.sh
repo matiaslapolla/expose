@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end tests against a stub tailscale. Needs: bash, jq, python3, node + npm; tmux optional.
+# End-to-end tests against a stub tailscale. Needs: bash, jq, node + npm; tmux optional.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -67,10 +67,10 @@ expect "npm detection" "$(cd "$d" && "$EXPOSE" config)" "command: npm run dev --
 mkdir -p "$XDG_CONFIG_HOME/expose"
 echo "EXPOSE_HTTPS_OFFSET=1" >"$XDG_CONFIG_HOME/expose/config"
 expect "global config" "$(cd "$d" && "$EXPOSE" config)" "EXPOSE_HTTPS_OFFSET=1"
-printf '# comment\nEXPOSE_HTTPS_OFFSET = "2"\nEXPOSE_CMD=python3 -m http.server {port}\n' >"$d/.expose"
+printf '# comment\nEXPOSE_HTTPS_OFFSET = "2"\nEXPOSE_CMD=node server.js --port {port}\n' >"$d/.expose"
 out=$(cd "$d" && "$EXPOSE" config)
 expect "project config beats global" "$out" "EXPOSE_HTTPS_OFFSET=2"
-expect "quoted value and EXPOSE_CMD" "$out" "command: python3 -m http.server {port}"
+expect "quoted value and EXPOSE_CMD" "$out" "command: node server.js --port {port}"
 expect "env beats project config" "$(cd "$d" && EXPOSE_HTTPS_OFFSET=3 "$EXPOSE" config)" "EXPOSE_HTTPS_OFFSET=3"
 echo "BOGUS=1" >>"$d/.expose"
 expect "unknown key warns" "$(cd "$d" && "$EXPOSE" config 2>&1)" "unknown key BOGUS"
@@ -105,9 +105,9 @@ done
 unset EXPOSE_RUNNER
 
 # --- explicit port, EXPOSE_CMD, direct mode ---
-d=$TMP/py && mkdir -p "$d"
+d=$(app plain "") && rm "$d/package.json"
 : >"$STUB_LOG"
-out=$(cd "$d" && EXPOSE_MODE=direct EXPOSE_RUNNER=background EXPOSE_CMD='python3 -m http.server {port} --bind 127.0.0.1' "$EXPOSE" 41350 2>&1)
+out=$(cd "$d" && EXPOSE_MODE=direct EXPOSE_RUNNER=background EXPOSE_CMD='node server.js --port {port}' "$EXPOSE" 41350 2>&1)
 expect "EXPOSE_CMD on an explicit port" "$out" "http://box:41350"
 reject "direct mode skips tailscale serve" "$(cat "$STUB_LOG")" "serve --bg"
 EXPOSE_MODE=direct "$EXPOSE" off 41350 >/dev/null

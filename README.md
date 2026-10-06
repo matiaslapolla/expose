@@ -117,7 +117,7 @@ EXPOSE_RUNNER=background expose 4000
 ## Development
 
 ```sh
-./test/run.sh          # end-to-end tests against a stub tailscale (needs jq, python3, node; tmux optional)
+./test/run.sh          # end-to-end tests against a stub tailscale (needs jq, node; tmux optional)
 shellcheck bin/expose install.sh test/run.sh
 ```
 

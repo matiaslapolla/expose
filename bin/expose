@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+# expose — put a local dev server on your tailnet over HTTPS, starting it first if needed.
+# https://github.com/matiaslapolla/expose
+set -euo pipefail
+
+VERSION=0.1.0
+CONFIG_KEYS="EXPOSE_MODE EXPOSE_CMD EXPOSE_SCRIPT EXPOSE_PORT_FLAG EXPOSE_PORT_MIN EXPOSE_PORT_MAX EXPOSE_HTTPS_OFFSET EXPOSE_WAIT EXPOSE_RUNNER EXPOSE_TARGET_HOST EXPOSE_TAILSCALE"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  expose                 expose the dev server of the current dir, starting it if needed
+  expose <dir>           same, for <dir>
+  expose <port>          expose <port> if something listens there, else start the current dir's server on it
+  expose <dir> <port>    start <dir>'s dev server on <port> if it is not running, then expose it
+  expose ls              served ports and running dev servers
+  expose off <port>      stop exposing <port>; stops the dev server too if expose started it
+  expose config [dir]    effective configuration and the start command for [dir]
+  expose init            write a commented .expose file in the current dir
+
+Configuration (later wins): built-in defaults, ~/.config/expose/config,
+<project>/.expose, EXPOSE_* environment variables. See `expose init`.
+EOF
+}
+
+die() { echo "expose: $*" >&2; exit 1; }
+warn() { echo "expose: $*" >&2; }
+is_port() { [[ $1 =~ ^[0-9]+$ ]]; }
+
+OS=$(uname -s)
+ENV_SET=" $(compgen -e | grep '^EXPOSE_' | tr '\n' ' ' || true) "
+CONFIG_SOURCES=""
+CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/expose
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/expose
+
+: "${EXPOSE_MODE:=serve}"
+: "${EXPOSE_CMD:=}"
+: "${EXPOSE_SCRIPT:=dev}"
+: "${EXPOSE_PORT_FLAG:=--port}"
+: "${EXPOSE_PORT_MIN:=3000}"
+: "${EXPOSE_PORT_MAX:=9999}"
+: "${EXPOSE_HTTPS_OFFSET:=10000}"
+: "${EXPOSE_WAIT:=60}"
+: "${EXPOSE_RUNNER:=}"
+: "${EXPOSE_TARGET_HOST:=127.0.0.1}"
+: "${EXPOSE_TAILSCALE:=}"
+
+# KEY=value lines only; files are parsed, never sourced.
+load_config_file() {
+  local file=$1 line key val
+  [[ -f $file ]] || return 0
+  CONFIG_SOURCES="$CONFIG_SOURCES $file"
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+    if ! [[ $line =~ ^[[:space:]]*([A-Z_]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+      warn "$file: ignoring line: $line"
+      continue
+    fi
+    key=${BASH_REMATCH[1]} val=${BASH_REMATCH[2]}
+    val=${val%"${val##*[![:space:]]}"}
+    if [[ $val == \"*\" || $val == \'*\' ]]; then val=${val:1:${#val}-2}; fi
+    case " $CONFIG_KEYS " in *" $key "*) ;; *) warn "$file: unknown key $key"; continue ;; esac
+    case $ENV_SET in *" $key "*) continue ;; esac
+    printf -v "$key" '%s' "$val"
+  done <"$file"
+}
+
+project_root() {
+  local dir=$1 root
+  [[ -f $dir/.expose ]] && { echo "$dir"; return; }
+  root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) && [[ -f $root/.expose ]] && { echo "$root"; return; }
+  echo "$dir"
+}
+
+finalize_config() {
+  if [[ -z $EXPOSE_RUNNER ]]; then
+    if command -v tmux >/dev/null; then EXPOSE_RUNNER=tmux; else EXPOSE_RUNNER=background; fi
+  fi
+  if [[ -z $EXPOSE_TAILSCALE ]]; then
+    if command -v tailscale >/dev/null; then EXPOSE_TAILSCALE=tailscale
+    else EXPOSE_TAILSCALE=/Applications/Tailscale.app/Contents/MacOS/Tailscale; fi
+  fi
+  case $EXPOSE_MODE in serve | direct) ;; *) die "EXPOSE_MODE must be serve or direct, got: $EXPOSE_MODE" ;; esac
+  case $EXPOSE_RUNNER in tmux | background) ;; *) die "EXPOSE_RUNNER must be tmux or background, got: $EXPOSE_RUNNER" ;; esac
+  local n
+  for n in EXPOSE_PORT_MIN EXPOSE_PORT_MAX EXPOSE_HTTPS_OFFSET EXPOSE_WAIT; do
+    is_port "${!n}" || die "$n must be a number, got: ${!n}"
+  done
+  command -v jq >/dev/null || die "jq is required"
+  mkdir -p "$STATE_DIR"
+}
+
+load_project_config() {
+  load_config_file "$(project_root "$1")/.expose"
+  finalize_config
+}
+
+ts() { "$EXPOSE_TAILSCALE" "$@"; }
+
+ts_dns() {
+  local dns
+  dns=$(ts status --json 2>/dev/null | jq -r '.Self.DNSName // empty | rtrimstr(".")') || true
+  [[ -n $dns ]] || die "cannot read this machine's tailnet name; is tailscale running? ($EXPOSE_TAILSCALE)"
+  echo "$dns"
+}
+
+# "port pid" for every TCP listener this user can see
+listeners() {
+  if [[ $OS == Darwin ]]; then
+    lsof -nP -iTCP -sTCP:LISTEN -Fpn 2>/dev/null |
+      awk '/^p/ { pid = substr($0, 2) } /^n/ { n = split($0, a, ":"); print a[n], pid }' | sort -un
+  else
+    ss -ltnpH 2>/dev/null | sed -nE 's/^.*:([0-9]+) .*pid=([0-9]+).*$/\1 \2/p' | sort -un
+  fi
+}
+
+proc_cwd() {
+  if [[ $OS == Darwin ]]; then
+    lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p'
+  else
+    readlink "/proc/$1/cwd" 2>/dev/null
+  fi
+}
+
+port_in_use() {
+  if [[ $OS == Darwin ]]; then
+    lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+  else
+    ss -ltnH "sport = :$1" | grep -q .
+  fi
+}
+
+dir_listener_port() {
+  local dir=$1 port pid
+  while read -r port pid; do
+    [[ $(proc_cwd "$pid") == "$dir" ]] && { echo "$port"; return 0; }
+  done < <(listeners)
+  return 1
+}
+
+free_port() {
+  local p=$EXPOSE_PORT_MIN
+  while port_in_use "$p"; do
+    ((p++))
+    ((p <= EXPOSE_PORT_MAX)) || die "no free port in $EXPOSE_PORT_MIN-$EXPOSE_PORT_MAX"
+  done
+  echo "$p"
+}
+
+package_manager() {
+  local dir=$1 root d
+  root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null || echo "$dir")
+  for d in "$dir" "$root"; do
+    [[ -f $d/pnpm-lock.yaml ]] && { echo pnpm; return; }
+    [[ -f $d/bun.lock || -f $d/bun.lockb ]] && { echo bun; return; }
+    [[ -f $d/yarn.lock ]] && { echo yarn; return; }
+  done
+  echo npm
+}
+
+# Start command for <dir>, with {port} still in place.
+command_template() {
+  local dir=$1 pm
+  [[ -n $EXPOSE_CMD ]] && { echo "$EXPOSE_CMD"; return; }
+  [[ -f $dir/package.json ]] || die "no package.json in $dir; set EXPOSE_CMD (see: expose init)"
+  jq -e --arg s "$EXPOSE_SCRIPT" '.scripts[$s]' "$dir/package.json" >/dev/null ||
+    die "no \"$EXPOSE_SCRIPT\" script in $dir/package.json; set EXPOSE_SCRIPT or EXPOSE_CMD"
+  pm=$(package_manager "$dir")
+  if [[ $pm == npm ]]; then
+    echo "npm run $EXPOSE_SCRIPT -- $EXPOSE_PORT_FLAG {port}"
+  else
+    echo "$pm run $EXPOSE_SCRIPT $EXPOSE_PORT_FLAG {port}"
+  fi
+}
+
+kill_tree() {
+  local child
+  for child in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$child"; done
+  kill "$1" 2>/dev/null || true
+}
+
+runner_alive() {
+  local kind=$1 ref=$2
+  case $kind in
+    tmux) tmux has-session -t "=$ref" 2>/dev/null && [[ ! -f $STATE_DIR/$ref.exit ]] ;;
+    pid) kill -0 "$ref" 2>/dev/null ;;
+  esac
+}
+
+runner_output() {
+  local kind=$1 ref=$2
+  case $kind in
+    tmux) tmux capture-pane -pt "=$ref" 2>/dev/null | grep . | tail -20 ;;
+    pid) tail -20 "$STATE_DIR/$3.log" 2>/dev/null ;;
+  esac
+}
+
+runner_stop() {
+  local kind=$1 ref=$2
+  case $kind in
+    tmux) tmux kill-session -t "=$ref" 2>/dev/null || true; rm -f "$STATE_DIR/$ref.exit" ;;
+    pid) kill_tree "$ref" ;;
+  esac
+}
+
+start_dev() {
+  local dir=$1 port=$2 cmd kind ref found i
+  cmd=$(command_template "$dir")
+  cmd=${cmd//\{port\}/$port}
+  echo "starting in $dir: $cmd" >&2
+  case $EXPOSE_RUNNER in
+    tmux)
+      kind=tmux ref="expose-$port"
+      tmux has-session -t "=$ref" 2>/dev/null && die "tmux session $ref already exists"
+      rm -f "$STATE_DIR/$ref.exit"
+      # shellcheck disable=SC2016
+      tmux new-session -d -s "$ref" -c "$dir" -e "PATH=$PATH" sh -c \
+        'eval "$1"; echo "$?" > "$2"; printf "\n[dev server exited]\n"; read _' sh "$cmd" "$STATE_DIR/$ref.exit"
+      echo "logs: tmux attach -t $ref" >&2
+      ;;
+    background)
+      kind=pid
+      ref=$(cd "$dir" && { nohup sh -c "exec $cmd" >"$STATE_DIR/$port.log" 2>&1 & echo $!; })
+      echo "logs: $STATE_DIR/$port.log" >&2
+      ;;
+  esac
+  for ((i = 0; i < EXPOSE_WAIT; i++)); do
+    if found=$(dir_listener_port "$dir") || { port_in_use "$port" && found=$port; }; then
+      echo "$kind $ref" >"$STATE_DIR/$found.run"
+      echo "$found"
+      return
+    fi
+    if ! runner_alive "$kind" "$ref"; then
+      runner_output "$kind" "$ref" "$port" >&2
+      runner_stop "$kind" "$ref"
+      die "dev server exited before listening"
+    fi
+    sleep 1
+  done
+  runner_output "$kind" "$ref" "$port" >&2
+  die "dev server did not listen within ${EXPOSE_WAIT}s; it is still running ($kind $ref)"
+}
+
+serve() {
+  local port=$1 https dns err
+  dns=$(ts_dns)
+  if [[ $EXPOSE_MODE == serve ]]; then
+    https=$((port + EXPOSE_HTTPS_OFFSET))
+    ((https <= 65535)) || die "HTTPS port $https is out of range; lower EXPOSE_HTTPS_OFFSET"
+    if ! err=$(ts serve --bg --https="$https" "http://$EXPOSE_TARGET_HOST:$port" 2>&1 >/dev/null); then
+      echo "$err" >&2
+      case $err in
+        *denied* | *operator*) warn "hint: sudo tailscale set --operator=\$USER" ;;
+        *HTTPS* | *cert*) warn "hint: enable HTTPS certificates in the Tailscale admin console (DNS page)" ;;
+      esac
+      die "tailscale serve failed"
+    fi
+    echo "https://$dns:$https  ->  :$port"
+  fi
+  echo "http://${dns%%.*}:$port  (direct, no TLS)"
+}
+
+cmd_expose() {
+  local dir port
+  if is_port "${1:-}"; then
+    dir=$(pwd -P)
+    port=$1
+    load_project_config "$dir"
+    port_in_use "$port" || port=$(start_dev "$dir" "$port")
+  else
+    dir=$(cd "${1:-.}" 2>/dev/null && pwd -P) || die "no such dir: ${1:-.}"
+    [[ -z ${2:-} ]] || is_port "$2" || die "not a port: $2"
+    load_project_config "$dir"
+    port=$(dir_listener_port "$dir") || port=$(start_dev "$dir" "${2:-$(free_port)}")
+  fi
+  serve "$port"
+}
+
+cmd_ls() {
+  load_project_config "$(pwd -P)"
+  if [[ $EXPOSE_MODE == serve ]]; then ts serve status || true; fi
+  echo "dev servers ($EXPOSE_PORT_MIN-$EXPOSE_PORT_MAX):"
+  local port pid mark
+  while read -r port pid; do
+    ((port >= EXPOSE_PORT_MIN && port <= EXPOSE_PORT_MAX)) || continue
+    mark=""
+    [[ -f $STATE_DIR/$port.run ]] && mark="  [started by expose]"
+    printf '  :%-6s %s%s\n' "$port" "$(proc_cwd "$pid")" "$mark"
+  done < <(listeners)
+}
+
+cmd_off() {
+  local port=${1:-} kind ref
+  is_port "$port" || die "usage: expose off <port>"
+  load_project_config "$(pwd -P)"
+  if [[ $EXPOSE_MODE == serve ]]; then
+    local https=$((port + EXPOSE_HTTPS_OFFSET))
+    if ts serve --https="$https" off >/dev/null 2>&1; then
+      echo "stopped serving :$https"
+    else
+      warn "nothing was served on :$https"
+    fi
+  fi
+  if [[ -f $STATE_DIR/$port.run ]]; then
+    read -r kind ref <"$STATE_DIR/$port.run"
+    runner_stop "$kind" "$ref"
+    rm -f "$STATE_DIR/$port.run"
+    echo "stopped dev server on :$port"
+  fi
+}
+
+cmd_config() {
+  local dir key
+  dir=$(cd "${1:-.}" 2>/dev/null && pwd -P) || die "no such dir: ${1:-.}"
+  load_project_config "$dir"
+  echo "sources: defaults${CONFIG_SOURCES:+ }${CONFIG_SOURCES# } env"
+  for key in $CONFIG_KEYS; do printf '%s=%s\n' "$key" "${!key}"; done
+  printf 'command: %s\n' "$(command_template "$dir" 2>&1)"
+}
+
+cmd_init() {
+  [[ -e .expose ]] && die ".expose already exists"
+  cat >.expose <<'EOF'
+# expose — per-project settings. KEY=value, one per line; env vars EXPOSE_* override these.
+
+# Start command; {port} is replaced with the chosen port. Unset = run the
+# package.json script below with the detected package manager.
+# EXPOSE_CMD=php artisan serve --port {port}
+# EXPOSE_SCRIPT=dev
+# EXPOSE_PORT_FLAG=--port
+
+# serve = HTTPS through tailscale serve; direct = only print http://<host>:<port>
+# EXPOSE_MODE=serve
+# EXPOSE_HTTPS_OFFSET=10000
+# EXPOSE_TARGET_HOST=127.0.0.1
+
+# Port range for auto-picked ports and `expose ls`.
+# EXPOSE_PORT_MIN=3000
+# EXPOSE_PORT_MAX=9999
+
+# tmux (attachable) or background (nohup, logs in ~/.local/state/expose).
+# EXPOSE_RUNNER=tmux
+# EXPOSE_WAIT=60
+EOF
+  echo "wrote .expose"
+}
+
+main() {
+  case ${1:-} in
+    -h | --help | help) usage; return ;;
+    -v | --version) echo "expose $VERSION"; return ;;
+    init) cmd_init; return ;;
+  esac
+  load_config_file "$CONFIG_DIR/config"
+  case ${1:-} in
+    ls) cmd_ls ;;
+    off) cmd_off "${2:-}" ;;
+    config) cmd_config "${2:-}" ;;
+    *) cmd_expose "$@" ;;
+  esac
+}
+
+main "$@"
